@@ -126,3 +126,4 @@ COMMENT ON TABLE bronze.production_orders IS 'Ordens de produção - suporta INS
 COMMENT ON TABLE bronze.maintenance_orders IS 'Ordens de manutenção - suporta INSERT e UPDATE';
 COMMENT ON TABLE bronze.quality_inspections IS 'Inspeções de qualidade - suporta INSERT e UPDATE';
 
+

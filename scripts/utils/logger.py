@@ -162,3 +162,4 @@ def print_separator(char: str = "─", length: int = 80):
 # Logger padrão
 logger = setup_logger()
 
+
