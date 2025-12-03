@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 test-db = "tests.test_db_connection:main"
+test-databricks = "tests.test_databricks_comparison:main"
 equipment-gen = "scripts.generators.equipment_generator:main"
 iot-gen = "scripts.generators.iot_generator:main"
 production-gen = "scripts.generators.production_generator:main"

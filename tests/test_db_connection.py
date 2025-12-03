@@ -1,3 +1,4 @@
+import sys
 from scripts.generators.common import get_db_connection
 
 
@@ -48,3 +49,21 @@ def test_db_connection():
     conn.close()
     
     print("\n✅ Conexão bem-sucedida e todas as tabelas encontradas!")
+    return 0
+
+
+def main():
+    """Função main para executar como script."""
+    try:
+        test_db_connection()
+        return 0
+    except AssertionError as e:
+        print(f"\n❌ Erro: {e}")
+        return 1
+    except Exception as e:
+        print(f"\n❌ Erro inesperado: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

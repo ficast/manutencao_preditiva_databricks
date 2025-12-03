@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-Script de ingestão de dados do PostgreSQL local para Databricks Bronze.
+Script de ingestão de dados do PostgreSQL local para Databricks Bronze (otimizado).
 
-Suporta duas estratégias:
-1. databricks-sql-connector (INSERT direto via SQL) - padrão
-2. PySpark (Delta Lake via JDBC) - opcional
-
-Uso:
-    python databricks_bronze_ingestion.py --table equipment_master
-    python databricks_bronze_ingestion.py --table all
-    python databricks_bronze_ingestion.py --table iot_sensor_readings --method spark --days-back 7
+Principais melhorias:
+- Uso de watermark real (MAX(timestamp) no Databricks) para carga incremental
+- Uso de staging table + MERGE INTO em vez de UPDATE linha a linha
+- Menos roundtrips na conexão Databricks
 """
 
 import argparse
@@ -17,8 +13,12 @@ import os
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from rich.progress import Progress
 from dotenv import load_dotenv
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -34,7 +34,7 @@ from utils.logger import (
     print_summary_table,
     logger,
 )
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
 from rich import box
 
@@ -59,6 +59,19 @@ TIMESTAMP_COLUMNS = {
     "quality_inspections": "last_update",
 }
 
+# Mapeamento de chaves primárias para MERGE
+PRIMARY_KEYS = {
+    "equipment_master": "equipment_id",
+    "iot_sensor_readings": "reading_id",
+    "production_orders": "production_order_id",
+    "maintenance_orders": "maintenance_order_id",
+    "quality_inspections": "inspection_id",
+}
+
+
+# ---------------------------------------------------------------------------
+# Conexões
+# ---------------------------------------------------------------------------
 
 def get_postgres_connection():
     """Cria conexão com PostgreSQL local."""
@@ -80,13 +93,13 @@ def get_databricks_connection():
             "databricks-sql-connector não está instalado. "
             "Instale com: uv pip install databricks-sql-connector"
         )
-    
+
     connection_params = {
         "server_hostname": os.getenv("DATABRICKS_SERVER_HOSTNAME"),
         "http_path": os.getenv("DATABRICKS_HTTP_PATH"),
         "access_token": os.getenv("DATABRICKS_ACCESS_TOKEN"),
     }
-    
+
     # Validar parâmetros obrigatórios
     missing = [k for k, v in connection_params.items() if not v]
     if missing:
@@ -94,188 +107,115 @@ def get_databricks_connection():
             f"Variáveis de ambiente faltando: {', '.join(missing)}. "
             f"Configure no arquivo .env"
         )
-    
+
     return sql.connect(**connection_params)
 
 
-def read_from_postgres(
-    table: str,
-    is_full_load: bool = False,
-    days_back: int = 90
-) -> List[Dict]:
-    """
-    Lê dados do PostgreSQL local.
-    
-    Args:
-        table: Nome da tabela (sem schema)
-        is_full_load: Se True, lê todos os dados. Se False, usa incremental com watermark
-        days_back: Quantos dias atrás buscar (para incremental)
-    
-    Returns:
-        Lista de dicionários com os dados
-    """
-    conn = get_postgres_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
-    schema_table = f"bronze.{table}"
-    
-    if is_full_load:
-        query = f"SELECT * FROM {schema_table}"
-    else:
-        # Incremental: usar watermark
-        timestamp_col = TIMESTAMP_COLUMNS.get(table)
-        if not timestamp_col:
-            logger.warning(f"Tabela {table} não tem coluna de timestamp configurada. Usando full load.")
-            query = f"SELECT * FROM {schema_table}"
-        else:
-            # Buscar registros dos últimos N dias ou NULL
-            cutoff = datetime.utcnow() - timedelta(days=days_back)
-            query = f"""
-                SELECT * FROM {schema_table}
-                WHERE {timestamp_col} IS NULL 
-                   OR {timestamp_col} >= %s
-            """
-            cursor.execute(query, (cutoff.strftime("%Y-%m-%d %H:%M:%S"),))
-            results = cursor.fetchall()
-            cursor.close()
-            conn.close()
-            return [dict(row) for row in results]
-    
-    cursor.execute(query)
-    results = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    
-    return [dict(row) for row in results]
-
-
-def write_to_databricks_sql(table: str, data: List[Dict]) -> int:
-    """
-    Escreve dados no Databricks usando databricks-sql-connector (INSERT direto).
-    
-    Args:
-        table: Nome da tabela (sem schema)
-        data: Lista de dicionários com dados
-    
-    Returns:
-        Número de registros inseridos
-    """
-    if not data:
-        return 0
-    
-    conn = get_databricks_connection()
-    cursor = conn.cursor()
-    
-    # Schema e catalog do Databricks (configurável via env)
+def get_full_table_name(table: str) -> str:
+    """Retorna nome totalmente qualificado da tabela no Databricks."""
     catalog = os.getenv("DATABRICKS_CATALOG", "main")
     schema = os.getenv("DATABRICKS_SCHEMA", "bronze")
-    full_table = f"{catalog}.{schema}.{table}"
-    
-    # Preparar INSERT
-    columns = list(data[0].keys())
-    # Databricks SQL usa ? como placeholder (ou %s com use_inline_params=True)
-    placeholders = ", ".join(["?"] * len(columns))
-    columns_str = ", ".join(columns)
-    
-    query = f"INSERT INTO {full_table} ({columns_str}) VALUES ({placeholders})"
-    
-    # Inserir em lotes
-    batch_size = 1000
-    total_inserted = 0
-    
-    for i in range(0, len(data), batch_size):
-        batch = data[i:i + batch_size]
-        values = [tuple(row[col] for col in columns) for row in batch]
-        cursor.executemany(query, values)
-        total_inserted += len(batch)
-    
-    conn.commit()
-    cursor.close()
-    conn.close()
-    
-    return total_inserted
+    return f"{catalog}.{schema}.{table}"
 
 
-def write_to_databricks_spark(table: str, data: List[Dict]) -> int:
+def get_schema_name() -> str:
+    return os.getenv("DATABRICKS_SCHEMA", "bronze")
+
+
+# ---------------------------------------------------------------------------
+# Utilitários Databricks (existência, watermark, criação de tabelas)
+# ---------------------------------------------------------------------------
+
+def check_table_exists_in_databricks(table: str) -> bool:
     """
-    Escreve dados no Databricks usando PySpark (Delta Lake).
-    
-    Args:
-        table: Nome da tabela (sem schema)
-        data: Lista de dicionários com dados
-    
-    Returns:
-        Número de registros inseridos
+    Verifica se a tabela existe no Databricks.
     """
+    full_table = get_full_table_name(table)
+    schema = get_schema_name()
+
     try:
-        from pyspark.sql import SparkSession
-        from pyspark.sql.types import StructType, StructField, StringType
-    except ImportError:
-        raise ImportError(
-            "PySpark não está instalado. "
-            "Instale com: uv pip install pyspark delta-spark"
+        with get_databricks_connection() as conn:
+            with conn.cursor() as cursor:
+                # SHOW TABLES é mais robusto que information_schema em alguns cenários
+                show_query = f"SHOW TABLES IN {schema} LIKE '{table}'"
+                cursor.execute(show_query)
+                row = cursor.fetchone()
+                exists = row is not None
+                return exists
+    except Exception as e:
+        logger.debug(f"Não foi possível verificar tabela {full_table}: {e}. Assumindo que não existe.")
+        return False
+
+def get_postgres_max_timestamp(table: str) -> Optional[datetime]:
+    timestamp_col = TIMESTAMP_COLUMNS.get(table)
+    if not timestamp_col:
+        return None
+
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT MAX({timestamp_col}) FROM bronze.{table}"
         )
-    
-    if not data:
-        return 0
-    
-    # Configurar Spark
-    spark = SparkSession.builder \
-        .appName("DatabricksBronzeIngestion") \
-        .config("spark.jars.packages", "io.delta:delta-spark_2.12:2.4.0") \
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-        .getOrCreate()
-    
-    # Criar DataFrame
-    # Inferir schema (todos STRING para Bronze)
-    schema = StructType([
-        StructField(col, StringType(), True) 
-        for col in data[0].keys()
-    ])
-    
-    df = spark.createDataFrame(data, schema=schema)
-    
-    # Escrever no Databricks (Delta Lake)
-    catalog = os.getenv("DATABRICKS_CATALOG", "main")
-    schema = os.getenv("DATABRICKS_SCHEMA", "bronze")
-    full_table = f"{catalog}.{schema}.{table}"
-    
-    df.write \
-        .format("delta") \
-        .mode("append") \
-        .option("mergeSchema", "true") \
-        .saveAsTable(full_table)
-    
-    count = df.count()
-    spark.stop()
-    
-    return count
+        result = cur.fetchone()
+        if result and result[0]:
+            return result[0]
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def get_databricks_max_timestamp(table: str) -> Optional[datetime]:
+    """
+    Obtém o MAX(timestamp) da tabela Bronze no Databricks para usar como watermark.
+    """
+    timestamp_col = TIMESTAMP_COLUMNS.get(table)
+    if not timestamp_col:
+        return None
+
+    full_table = get_full_table_name(table)
+
+    try:
+        with get_databricks_connection() as conn:
+            with conn.cursor() as cursor:
+                query = f"SELECT MAX({timestamp_col}) FROM {full_table}"
+                cursor.execute(query)
+                result = cursor.fetchone()
+                max_ts = result[0] if result else None
+
+                if max_ts is None:
+                    return None
+
+                # databricks-sql-connector pode retornar str ou datetime
+                if isinstance(max_ts, datetime):
+                    return max_ts
+                if isinstance(max_ts, str):
+                    # tenta parsear ISO8601
+                    try:
+                        return datetime.fromisoformat(max_ts.replace("Z", ""))
+                    except Exception:
+                        logger.warning(f"Não foi possível parsear MAX({timestamp_col})='{max_ts}' como datetime.")
+                        return None
+
+                return None
+    except Exception as e:
+        logger.debug(f"Erro ao buscar watermark para {table}: {e}")
+        return None
 
 
 def create_bronze_table_if_not_exists(table: str) -> None:
     """
     Cria a tabela Bronze no Databricks se ela não existir.
-    
-    Args:
-        table: Nome da tabela (sem schema)
+    (mantive a tua definição, mas aqui é o lugar ideal para melhorar tipos)
     """
-    conn = get_databricks_connection()
-    cursor = conn.cursor()
-    
+    from textwrap import dedent
+
     catalog = os.getenv("DATABRICKS_CATALOG", "main")
     schema = os.getenv("DATABRICKS_SCHEMA", "bronze")
-    
-    # Criar schema se não existir
-    try:
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-        conn.commit()
-    except Exception as e:
-        logger.debug(f"Schema {schema} já existe ou erro ao criar: {e}")
-    
-    # Definir schemas das tabelas
+
     table_schemas = {
-        "equipment_master": """
+        "equipment_master": dedent("""
             CREATE TABLE IF NOT EXISTS {full_table} (
                 equipment_id      STRING,
                 equipment_name    STRING,
@@ -292,8 +232,8 @@ def create_bronze_table_if_not_exists(table: str) -> None:
                 'delta.autoOptimize.optimizeWrite' = 'true',
                 'delta.autoOptimize.autoCompact' = 'true'
             )
-        """,
-        "iot_sensor_readings": """
+        """),
+        "iot_sensor_readings": dedent("""
             CREATE TABLE IF NOT EXISTS {full_table} (
                 reading_id        STRING,
                 equipment_id      STRING,
@@ -308,8 +248,8 @@ def create_bronze_table_if_not_exists(table: str) -> None:
                 'delta.autoOptimize.optimizeWrite' = 'true',
                 'delta.autoOptimize.autoCompact' = 'true'
             )
-        """,
-        "production_orders": """
+        """),
+        "production_orders": dedent("""
             CREATE TABLE IF NOT EXISTS {full_table} (
                 production_order_id STRING,
                 equipment_id        STRING,
@@ -328,8 +268,8 @@ def create_bronze_table_if_not_exists(table: str) -> None:
                 'delta.autoOptimize.optimizeWrite' = 'true',
                 'delta.autoOptimize.autoCompact' = 'true'
             )
-        """,
-        "maintenance_orders": """
+        """),
+        "maintenance_orders": dedent("""
             CREATE TABLE IF NOT EXISTS {full_table} (
                 maintenance_order_id STRING,
                 equipment_id         STRING,
@@ -349,8 +289,8 @@ def create_bronze_table_if_not_exists(table: str) -> None:
                 'delta.autoOptimize.optimizeWrite' = 'true',
                 'delta.autoOptimize.autoCompact' = 'true'
             )
-        """,
-        "quality_inspections": """
+        """),
+        "quality_inspections": dedent("""
             CREATE TABLE IF NOT EXISTS {full_table} (
                 inspection_id       STRING,
                 production_order_id STRING,
@@ -370,115 +310,257 @@ def create_bronze_table_if_not_exists(table: str) -> None:
                 'delta.autoOptimize.optimizeWrite' = 'true',
                 'delta.autoOptimize.autoCompact' = 'true'
             )
-        """
+        """),
     }
-    
+
     if table not in table_schemas:
         logger.warning(f"Schema não definido para tabela {table}. Pulando criação.")
-        cursor.close()
-        conn.close()
         return
-    
+
     full_table = f"{catalog}.{schema}.{table}"
     create_sql = table_schemas[table].format(full_table=full_table)
-    
+
     try:
-        logger.info(f"Criando tabela {full_table} se não existir...")
-        cursor.execute(create_sql)
-        conn.commit()
-        logger.info(f"Tabela {full_table} criada ou já existe.")
+        with get_databricks_connection() as conn:
+            with conn.cursor() as cursor:
+                # Criar schema se não existir (sem catalogo explicitado para compatibilidade)
+                try:
+                    cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+                except Exception as e:
+                    logger.debug(f"Schema {schema} já existe ou erro ao criar: {e}")
+
+                logger.info(f"Criando tabela {full_table} se não existir...")
+                cursor.execute(create_sql)
+                logger.info(f"Tabela {full_table} criada ou já existe.")
     except Exception as e:
         logger.error(f"Erro ao criar tabela {full_table}: {e}")
         raise
+
+
+def create_staging_table_if_not_exists(table: str) -> str:
+    """
+    Cria uma staging table Delta para usar em operações de MERGE.
+    """
+    full_table = get_full_table_name(table)
+    staging_table = full_table + "__staging"
+
+    try:
+        with get_databricks_connection() as conn:
+            with conn.cursor() as cursor:
+                # Cria staging com o mesmo schema da tabela principal
+                create_sql = f"CREATE TABLE IF NOT EXISTS {staging_table} LIKE {full_table}"
+                cursor.execute(create_sql)
+                # Garante que staging esteja vazia antes de usar
+                cursor.execute(f"TRUNCATE TABLE {staging_table}")
+        return staging_table
+    except Exception as e:
+        logger.error(f"Erro ao criar staging table {staging_table}: {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Leitura Postgres
+# ---------------------------------------------------------------------------
+
+def read_from_postgres(
+    table: str,
+    is_full_load: bool = False,
+    days_back: int = 90,
+    watermark: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Lê dados do PostgreSQL local.
+
+    Se watermark for informado, ele é usado diretamente.
+    Caso contrário, usa is_full_load/days_back.
+    """
+    conn = get_postgres_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+    schema_table = f"bronze.{table}"
+
+    try:
+        if is_full_load:
+            query = f"SELECT * FROM {schema_table}"
+            cursor.execute(query)
+        else:
+            timestamp_col = TIMESTAMP_COLUMNS.get(table)
+            if not timestamp_col:
+                logger.warning(
+                    f"Tabela {table} não tem coluna de timestamp configurada. Usando full load."
+                )
+                query = f"SELECT * FROM {schema_table}"
+                cursor.execute(query)
+            else:
+                if watermark is None:
+                    cutoff = datetime.utcnow() - timedelta(days=days_back)
+                    logger.info(
+                        f"Usando cutoff de {days_back} dias para {table}: {cutoff.isoformat()}"
+                    )
+                else:
+                    cutoff = watermark
+                    logger.info(
+                        f"Usando watermark do Databricks para {table}: {cutoff.isoformat()}"
+                    )
+
+                query = f"""
+                    SELECT * FROM {schema_table}
+                    WHERE {timestamp_col} IS NULL
+                       OR {timestamp_col} > %s
+                """
+                cursor.execute(query, (cutoff,))
+        results = cursor.fetchall()
+        return [dict(row) for row in results]
     finally:
         cursor.close()
         conn.close()
 
 
-def check_table_exists_in_databricks(table: str) -> bool:
-    """
-    Verifica se a tabela existe no Databricks e se tem dados.
-    
-    Returns:
-        True se a tabela existe e tem dados, False caso contrário
-    """
-    try:
-        conn = get_databricks_connection()
-        cursor = conn.cursor()
-        
-        catalog = os.getenv("DATABRICKS_CATALOG", "main")
-        schema = os.getenv("DATABRICKS_SCHEMA", "bronze")
-        full_table = f"{catalog}.{schema}.{table}"
-        
-        # Verificar se a tabela existe e tem dados
-        # Usar INFORMATION_SCHEMA para verificar existência primeiro
-        check_query = f"""
-            SELECT COUNT(*) 
-            FROM information_schema.tables 
-            WHERE table_schema = '{schema}' 
-              AND table_name = '{table}'
-        """
-        cursor.execute(check_query)
-        table_exists = cursor.fetchone()[0] > 0
-        
-        if not table_exists:
-            cursor.close()
-            conn.close()
-            return False
-        
-        # Se existe, verificar se tem dados
-        count_query = f"SELECT COUNT(*) as cnt FROM {full_table} LIMIT 1"
-        try:
-            cursor.execute(count_query)
-            result = cursor.fetchone()
-            count = result[0] if result else 0
-            has_data = count > 0
-        except Exception as e:
-            # Erro ao contar (pode ser permissão ou tabela vazia)
-            logger.debug(f"Erro ao verificar dados da tabela {table}: {e}")
-            has_data = False
-        
-        cursor.close()
-        conn.close()
-        return has_data
-    except Exception as e:
-        # Se não conseguir conectar, assume que não existe (primeira carga)
-        logger.debug(f"Não foi possível verificar tabela no Databricks: {e}. Assumindo primeira carga.")
-        return False
+# ---------------------------------------------------------------------------
+# Escrita Databricks (otimizada com staging + MERGE)
+# ---------------------------------------------------------------------------
 
+def write_to_databricks_sql(
+    table: str,
+    data: List[Dict[str, Any]],
+    is_full_load: bool,
+    progress: Optional["Progress"] = None,
+    task_id: Optional[int] = None,
+) -> int:
+    """
+    Escreve dados no Databricks usando databricks-sql-connector.
+    - Full load: INSERT direto
+    - Incremental: staging + MERGE
+    """
+    if not data:
+        return 0
+
+    full_table = get_full_table_name(table)
+    primary_key = PRIMARY_KEYS.get(table)
+    columns = list(data[0].keys())
+    batch_size = 50
+
+    total_processed = 0
+
+    with get_databricks_connection() as conn:
+        with conn.cursor() as cursor:
+            try:
+                # FULL LOAD
+                if is_full_load or not primary_key or primary_key not in columns:
+                    logger.info(f"Modo full load para {table}. INSERT direto.")
+
+                    placeholders = ", ".join(["?"] * len(columns))
+                    columns_str = ", ".join(columns)
+                    insert_query = f"INSERT INTO {full_table} ({columns_str}) VALUES ({placeholders})"
+
+                    for i in range(0, len(data), batch_size):
+                        batch = data[i:i + batch_size]
+                        values = [tuple(row.get(col) for col in columns) for row in batch]
+                        cursor.executemany(insert_query, values)
+
+                        total_processed += len(batch)
+                        if progress and task_id:
+                            progress.update(task_id, completed=total_processed)
+
+                    print_success(f"INSERT FULL LOAD concluído para {table}. Registros: {total_processed}")
+                    return total_processed
+
+                # INCREMENTAL (MERGE)
+                logger.info(f"Modo incremental para {table}: staging + MERGE INTO.")
+
+                staging_table = create_staging_table_if_not_exists(table)
+
+                # INSERT na staging
+                placeholders = ", ".join(["?"] * len(columns))
+                columns_str = ", ".join(columns)
+                insert_staging = f"INSERT INTO {staging_table} ({columns_str}) VALUES ({placeholders})"
+
+                for i in range(0, len(data), batch_size):
+                    batch = data[i:i + batch_size]
+                    values = [tuple(row.get(col) for col in columns) for row in batch]
+                    cursor.executemany(insert_staging, values)
+
+                    total_processed += len(batch)
+                    if progress and task_id:
+                        progress.update(task_id, completed=total_processed)
+
+                # MERGE INTO
+                non_pk_cols = [c for c in columns if c != primary_key]
+                set_clause = ", ".join([f"t.{c} = s.{c}" for c in non_pk_cols])
+                insert_cols = ", ".join(columns)
+                insert_vals = ", ".join([f"s.{c}" for c in columns])
+
+                merge_sql = f"""
+                    MERGE INTO {full_table} t
+                    USING {staging_table} s
+                    ON t.{primary_key} = s.{primary_key}
+                    WHEN MATCHED THEN UPDATE SET {set_clause}
+                    WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
+                """
+
+                cursor.execute(merge_sql)
+                cursor.execute(f"TRUNCATE TABLE {staging_table}")
+
+                print_success(
+                    f"MERGE concluído para {table}. Registros processados: {total_processed}"
+                )
+
+                return total_processed
+
+            except Exception as e:
+                logger.error(f"Erro ao escrever no Databricks ({table}): {e}")
+                raise
+
+
+# ---------------------------------------------------------------------------
+# Orquestração de ingestão por tabela
+# ---------------------------------------------------------------------------
 
 def ingest_table(
     table: str,
-    method: str = "sql",
-    days_back: int = 90
+    days_back: int = 90,
 ) -> int:
     """
     Ingere uma tabela do PostgreSQL para Databricks.
-    
-    Detecta automaticamente se é primeira carga (tabela não existe/vazia) e usa full load.
-    Caso contrário, usa incremental com watermark dos últimos N dias.
-    
-    Args:
-        table: Nome da tabela
-        method: 'sql' (databricks-sql-connector) ou 'spark' (PySpark)
-        days_back: Quantos dias atrás buscar (para incremental, se não for primeira carga)
-    
-    Returns:
-        Número de registros ingeridos
+
+    - Se tabela não existe: full load
+    - Se existe: incremental usando watermark (MAX(timestamp) no Databricks)
     """
-    # Detectar primeira carga: se tabela não existe/vazia, usa full load
     table_exists = check_table_exists_in_databricks(table)
+
+    postgres_max = get_postgres_max_timestamp(table)
+    databricks_max = get_databricks_max_timestamp(table)
+
+    if databricks_max and postgres_max and postgres_max <= databricks_max:
+        logger.info(f"No new data for {table}. Skipping ingestion.")
+        return 0
+
+
     is_full_load = not table_exists
-    actual_mode = "full" if is_full_load else "incremental"
-    
-    if is_full_load:
-        logger.info(f"Tabela {table} não existe ou está vazia no Databricks. Primeira carga: usando full load.")
+
+    if not table_exists:
+        logger.info(f"Tabela {table} não existe no Databricks. Primeira carga (full load).")
     else:
-        logger.info(f"Tabela {table} existe no Databricks. Usando incremental (últimos {days_back} dias).")
-    
-    logger.info(f"Lendo dados de bronze.{table} (modo: {actual_mode})...")
+        logger.info(f"Tabela {table} existe no Databricks. Usando modo incremental.")
+
+    # Garante que a tabela exista com o schema correto
+    create_bronze_table_if_not_exists(table)
+
+    # Watermark (apenas incremental)
+    watermark = None
+    if not is_full_load:
+        watermark = get_databricks_max_timestamp(table)
+        if watermark:
+            logger.info(f"Watermark atual no Databricks para {table}: {watermark.isoformat()}")
+        else:
+            logger.info(
+                f"Nenhum watermark válido encontrado para {table}. "
+                f"Usando fallback de {days_back} dias."
+            )
+
+    logger.info(f"Lendo dados de bronze.{table} (full_load={is_full_load})...")
     start_time = datetime.now()
-    
+
     try:
         with Progress(
             SpinnerColumn(),
@@ -487,92 +569,91 @@ def ingest_table(
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         ) as progress:
             task = progress.add_task("Lendo do PostgreSQL...", total=None)
-            data = read_from_postgres(table, is_full_load=is_full_load, days_back=days_back)
+            data = read_from_postgres(
+                table,
+                is_full_load=is_full_load,
+                days_back=days_back,
+                watermark=watermark,
+            )
             progress.update(task, completed=True)
-        
+
         read_time = (datetime.now() - start_time).total_seconds()
         logger.info(f"{len(data)} registros lidos do PostgreSQL em {read_time:.2f}s")
-        
+
         if not data:
             print_warning(f"Nenhum dado novo para ingerir em {table}")
             return 0
-        
-        logger.info(f"Escrevendo dados no Databricks (método: {method})...")
+
+        logger.info(f"Escrevendo dados no Databricks para {table}...")
         write_start = datetime.now()
-        
-        if method == "sql":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            ) as progress:
-                task = progress.add_task("Inserindo no Databricks...", total=len(data))
-                count = write_to_databricks_sql(table, data)
-                progress.update(task, completed=len(data))
-        elif method == "spark":
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-            ) as progress:
-                task = progress.add_task("Processando com Spark...", total=None)
-                count = write_to_databricks_spark(table, data)
-                progress.update(task, completed=True)
-        else:
-            raise ValueError(f"Método inválido: {method}. Use 'sql' ou 'spark'")
-        
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        ) as progress:
+            task = progress.add_task(
+                "Inserindo/MERGE no Databricks...", total=len(data)
+            )
+            count = write_to_databricks_sql(
+                table,
+                data,
+                is_full_load=is_full_load,
+                progress=progress,
+                task_id=task,
+            )
+
         write_time = (datetime.now() - write_start).total_seconds()
         total_time = (datetime.now() - start_time).total_seconds()
-        
-        print_success(f"{count} registros inseridos no Databricks")
-        
-        # Resumo da tabela
-        print_summary_table({
-            "Tabela": table,
-            "Modo": actual_mode,
-            "Método": method,
-            "Registros lidos": len(data),
-            "Registros inseridos": count,
-            "Tempo leitura": f"{read_time:.2f}s",
-            "Tempo escrita": f"{write_time:.2f}s",
-            "Tempo total": f"{total_time:.2f}s",
-            "Taxa": f"{count/total_time:.1f} registros/s" if total_time > 0 else "N/A"
-        }, title=f"Resumo - {table}")
-        
+
+        print_success(f"{count} registros processados no Databricks ({table})")
+
+        print_summary_table(
+            {
+                "Tabela": table,
+                "Modo": "full" if is_full_load else "incremental",
+                "Registros lidos": len(data),
+                "Registros processados": count,
+                "Tempo leitura": f"{read_time:.2f}s",
+                "Tempo escrita": f"{write_time:.2f}s",
+                "Tempo total": f"{total_time:.2f}s",
+                "Taxa": f"{count / total_time:.1f} registros/s" if total_time > 0 else "N/A",
+            },
+            title=f"Resumo - {table}",
+        )
+
         return count
-        
+
     except Exception as e:
         logger.error(f"Erro ao ingerir {table}: {e}", exc_info=True)
         print_error(f"Falha ao ingerir {table}: {e}")
         raise
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Ingestão de dados do PostgreSQL local para Databricks Bronze"
+        description="Ingestão de dados do PostgreSQL local para Databricks Bronze (otimizado)"
     )
     parser.add_argument(
         "--table",
         type=str,
         required=True,
-        help=f"Nome da tabela ou 'all' para todas. Tabelas: {', '.join(BRONZE_TABLES)}"
-    )
-    parser.add_argument(
-        "--method",
-        type=str,
-        choices=["sql", "spark"],
-        default="sql",
-        help="Método de escrita: sql (databricks-sql-connector) ou spark (PySpark)"
+        help=f"Nome da tabela ou 'all' para todas. Tabelas: {', '.join(BRONZE_TABLES)}",
     )
     parser.add_argument(
         "--days-back",
         type=int,
         default=90,
-        help="Quantos dias atrás buscar (para incremental, após primeira carga)"
+        help="Fallback de quantos dias atrás buscar (apenas se não houver watermark no Databricks)",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Validar tabela
     if args.table == "all":
         tables = BRONZE_TABLES
@@ -582,59 +663,67 @@ def main():
         print_error(f"Tabela inválida: {args.table}")
         logger.error(f"Tabelas disponíveis: {', '.join(BRONZE_TABLES)}")
         sys.exit(1)
-    
+
     # Header
     print_header(
-        "📤 Databricks Bronze Ingestion",
-        f"Tabelas: {len(tables)} | Método: {args.method} | Days back: {args.days_back}"
+        "📤 Databricks Bronze Ingestion (Optimized)",
+        f"Tabelas: {len(tables)} | Days back fallback: {args.days_back}",
     )
-    
+
     start_time = datetime.now()
-    total_inserted = 0
+    total_processed = 0
     results = []
-    
+
     for i, table in enumerate(tables, 1):
         logger.info(f"[{i}/{len(tables)}] Processando {table}...")
         try:
-            count = ingest_table(table, method=args.method, days_back=args.days_back)
-            total_inserted += count
-            results.append({"tabela": table, "registros": count, "status": "✅ Sucesso"})
+            count = ingest_table(table, days_back=args.days_back)
+            total_processed += count
+            results.append(
+                {"tabela": table, "registros": count, "status": "✅ Sucesso"}
+            )
         except Exception as e:
             logger.error(f"Falha ao ingerir {table}: {e}")
-            results.append({"tabela": table, "registros": 0, "status": f"❌ Erro: {str(e)[:50]}"})
+            results.append(
+                {
+                    "tabela": table,
+                    "registros": 0,
+                    "status": f"❌ Erro: {str(e)[:80]}",
+                }
+            )
             if args.table != "all":
                 sys.exit(1)
-    
+
     total_time = (datetime.now() - start_time).total_seconds()
-    
+
     # Resumo final
     print_header("📊 Resumo Final da Ingestão")
-    
+
     summary_table = Table(show_header=True, header_style="bold cyan", box=box.ROUNDED)
     summary_table.add_column("Tabela", style="cyan")
     summary_table.add_column("Registros", justify="right", style="green")
     summary_table.add_column("Status", style="yellow")
-    
+
     for result in results:
         summary_table.add_row(
-            result["tabela"],
-            str(result["registros"]),
-            result["status"]
+            result["tabela"], str(result["registros"]), result["status"]
         )
-    
+
     summary_table.add_row("", "", "", style="bold")
     summary_table.add_row(
         "[bold]TOTAL[/bold]",
-        f"[bold green]{total_inserted}[/bold green]",
-        f"[bold]Tempo: {total_time:.2f}s[/bold]"
+        f"[bold green]{total_processed}[/bold green]",
+        f"[bold]Tempo: {total_time:.2f}s[/bold]",
     )
-    
+
     from utils.logger import console
+
     console.print(summary_table)
-    
-    print_success(f"Ingestão concluída: {total_inserted} registros inseridos no total em {total_time:.2f}s")
+
+    print_success(
+        f"Ingestão concluída: {total_processed} registros processados no total em {total_time:.2f}s"
+    )
 
 
 if __name__ == "__main__":
     main()
-
