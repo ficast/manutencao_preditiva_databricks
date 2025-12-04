@@ -403,10 +403,11 @@ def read_from_postgres(
                         f"Usando watermark do Databricks para {table}: {cutoff.isoformat()}"
                     )
 
+                # Usa função auxiliar que tenta múltiplos formatos de timestamp
                 query = f"""
                     SELECT * FROM {schema_table}
                     WHERE {timestamp_col} IS NULL
-                       OR {timestamp_col} > %s
+                       OR bronze.try_parse_timestamp({timestamp_col}) > %s
                 """
                 cursor.execute(query, (cutoff,))
         results = cursor.fetchall()

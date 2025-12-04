@@ -116,4 +116,42 @@ COMMENT ON TABLE bronze.production_orders IS 'Ordens de produção - suporta INS
 COMMENT ON TABLE bronze.maintenance_orders IS 'Ordens de manutenção - suporta INSERT e UPDATE';
 COMMENT ON TABLE bronze.quality_inspections IS 'Inspeções de qualidade - suporta INSERT e UPDATE';
 
+-- ============================================================
+-- Função auxiliar para converter timestamps em múltiplos formatos
+-- ============================================================
+CREATE OR REPLACE FUNCTION bronze.try_parse_timestamp(ts_text TEXT)
+RETURNS TIMESTAMP AS $$
+DECLARE
+    formats TEXT[] := ARRAY[
+        'YYYY-MM-DD HH24:MI:SS',
+        'YYYY-MM-DD',
+        'YYYY/MM/DD HH24:MI:SS',
+        'YYYY/MM/DD',
+        'DD/MM/YYYY HH24:MI:SS',
+        'DD/MM/YYYY',
+        'DD-MM-YYYY HH24:MI:SS',
+        'DD-MM-YYYY',
+        'YYYY-MM-DD"T"HH24:MI:SS',
+        'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+    ];
+    fmt TEXT;
+BEGIN
+    IF ts_text IS NULL OR ts_text = '' THEN
+        RETURN NULL;
+    END IF;
+    
+    FOREACH fmt IN ARRAY formats
+    LOOP
+        BEGIN
+            RETURN TO_TIMESTAMP(ts_text, fmt);
+        EXCEPTION WHEN OTHERS THEN
+            CONTINUE;
+        END;
+    END LOOP;
+    
+    -- Se nenhum formato funcionou, retorna NULL
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 
