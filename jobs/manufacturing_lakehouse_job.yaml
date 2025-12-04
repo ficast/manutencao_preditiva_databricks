@@ -1,292 +1,245 @@
 resources:
   jobs:
-    manufacturing_lakehouse_pipeline:
+    Manufacturing_Lakehouse_Pipeline:
       name: Manufacturing Lakehouse Pipeline
+      timeout_seconds: 7200
+      tasks:
+        - task_key: silver_equipment_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/equipment_clean
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_bronze: bronze
+              schema_silver: silver
+            source: WORKSPACE
+          description: Limpeza e normalização de equipamentos
+        - task_key: gold_dim_equipamento
+          depends_on:
+            - task_key: silver_equipment_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_equipamento
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão equipamento (snapshot atual)
+        - task_key: gold_dim_tempo
+          depends_on:
+            - task_key: silver_equipment_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_tempo
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão de tempo (calendário)
+        - task_key: silver_equipment_scd
+          depends_on:
+            - task_key: silver_equipment_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/equipment_scd
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_bronze: bronze
+              schema_silver: silver
+            source: WORKSPACE
+          description: SCD Type 2 para equipamentos
+        - task_key: gold_dim_equipamento_scd
+          depends_on:
+            - task_key: silver_equipment_scd
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_equipamento_scd
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão equipamento SCD Type 2
+        - task_key: silver_iot_readings_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/iot_readings_clean
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_bronze: bronze
+              schema_silver: silver
+            source: WORKSPACE
+          description: Limpeza de leituras IoT
+        - task_key: gold_fact_iot_agregado
+          depends_on:
+            - task_key: gold_dim_equipamento
+            - task_key: gold_dim_tempo
+            - task_key: silver_iot_readings_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_iot_agregado
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Fato agregado de IoT (por hora)
+        - task_key: gold_vw_tendencias_sensores
+          depends_on:
+            - task_key: gold_fact_iot_agregado
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_tendencias_sensores
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_gold: gold
+            source: WORKSPACE
+          description: View de tendências de sensores
+        - task_key: silver_maintenance_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/maintenance_orders_clean
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_bronze: bronze
+              schema_silver: silver
+            source: WORKSPACE
+          description: Limpeza de ordens de manutenção
+        - task_key: gold_dim_tecnico
+          depends_on:
+            - task_key: silver_maintenance_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_tecnico
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão de técnicos
+        - task_key: gold_dim_tipo_manutencao
+          depends_on:
+            - task_key: silver_maintenance_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_tipo_manutencao
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão de tipos de manutenção
+        - task_key: gold_fact_manutencao
+          depends_on:
+            - task_key: gold_dim_tipo_manutencao
+            - task_key: gold_dim_tecnico
+            - task_key: gold_dim_tempo
+            - task_key: gold_dim_equipamento
+            - task_key: silver_maintenance_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_manutencao
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Fato de manutenção
+        - task_key: gold_vw_downtime_por_causa
+          depends_on:
+            - task_key: gold_fact_manutencao
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_downtime_por_causa
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_gold: gold
+            source: WORKSPACE
+          description: View de downtime por causa
+        - task_key: silver_production_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/production_orders_clean
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_bronze: bronze
+              schema_silver: silver
+            source: WORKSPACE
+          description: Limpeza de ordens de produção
+        - task_key: gold_dim_produto
+          depends_on:
+            - task_key: silver_production_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_produto
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão de produtos
+        - task_key: gold_fact_producao
+          depends_on:
+            - task_key: gold_dim_produto
+            - task_key: gold_dim_equipamento
+            - task_key: gold_dim_tempo
+            - task_key: silver_production_orders_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_producao
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Fato de produção
+        - task_key: gold_vw_oee_diario
+          depends_on:
+            - task_key: gold_fact_qualidade
+            - task_key: gold_dim_tempo
+            - task_key: gold_dim_equipamento
+            - task_key: gold_fact_manutencao
+            - task_key: gold_fact_producao
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_oee_diario
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_gold: gold
+            source: WORKSPACE
+          description: View de OEE diário
+        - task_key: silver_quality_inspections_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/quality_inspections_clean
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_bronze: bronze
+              schema_silver: silver
+            source: WORKSPACE
+          description: Limpeza de inspeções de qualidade
+        - task_key: gold_dim_defeito
+          depends_on:
+            - task_key: silver_quality_inspections_clean
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_defeito
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Dimensão de códigos de defeito
+        - task_key: gold_fact_qualidade
+          depends_on:
+            - task_key: gold_dim_defeito
+            - task_key: gold_dim_tempo
+            - task_key: gold_dim_equipamento
+            - task_key: silver_quality_inspections_clean
+            - task_key: gold_dim_produto
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_qualidade
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_silver: silver
+              schema_gold: gold
+            source: WORKSPACE
+          description: Fato de qualidade
+        - task_key: gold_vw_equipamentos_criticos
+          depends_on:
+            - task_key: gold_fact_producao
+            - task_key: gold_fact_manutencao
+            - task_key: gold_fact_qualidade
+          notebook_task:
+            notebook_path: /Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_equipamentos_criticos
+            base_parameters:
+              catalog: manufatura_lakehouse
+              schema_gold: gold
+            source: WORKSPACE
+          description: View de equipamentos críticos
       queue:
         enabled: true
-      
-      tasks:
-        # ============================================================
-        # SILVER LAYER - Processamento incremental
-        # ============================================================
-        
-        # Equipment Clean (deve rodar antes de equipment_scd)
-        - task_key: "silver_equipment_clean"
-          description: "Limpeza e normalização de equipamentos"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/equipment_clean.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_bronze: "bronze"
-              schema_silver: "silver"
-
-        # Equipment SCD (depende de equipment_clean)
-        - task_key: "silver_equipment_scd"
-          description: "SCD Type 2 para equipamentos"
-          depends_on:
-            - task_key: "silver_equipment_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/equipment_scd.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_bronze: "bronze"
-              schema_silver: "silver"
-
-        # IoT Readings Clean (pode rodar em paralelo)
-        - task_key: "silver_iot_readings_clean"
-          description: "Limpeza de leituras IoT"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/iot_readings_clean.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_bronze: "bronze"
-              schema_silver: "silver"
-
-        # Production Orders Clean (pode rodar em paralelo)
-        - task_key: "silver_production_orders_clean"
-          description: "Limpeza de ordens de produção"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/production_orders_clean.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_bronze: "bronze"
-              schema_silver: "silver"
-
-        # Maintenance Orders Clean (pode rodar em paralelo)
-        - task_key: "silver_maintenance_orders_clean"
-          description: "Limpeza de ordens de manutenção"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/maintenance_orders_clean.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_bronze: "bronze"
-              schema_silver: "silver"
-
-        # Quality Inspections Clean (pode rodar em paralelo)
-        - task_key: "silver_quality_inspections_clean"
-          description: "Limpeza de inspeções de qualidade"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/silver/quality_inspections_clean.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_bronze: "bronze"
-              schema_silver: "silver"
-
-        # ============================================================
-        # GOLD LAYER - Dimensões (podem rodar em paralelo após Silver)
-        # ============================================================
-        
-        # Dim Tempo (não depende de nada, pode rodar primeiro)
-        - task_key: "gold_dim_tempo"
-          description: "Dimensão de tempo (calendário)"
-          depends_on:
-            - task_key: "silver_equipment_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_tempo.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Dim Equipamento (depende de equipment_clean)
-        - task_key: "gold_dim_equipamento"
-          description: "Dimensão equipamento (snapshot atual)"
-          depends_on:
-            - task_key: "silver_equipment_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_equipamento.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Dim Equipamento SCD (depende de equipment_scd)
-        - task_key: "gold_dim_equipamento_scd"
-          description: "Dimensão equipamento SCD Type 2"
-          depends_on:
-            - task_key: "silver_equipment_scd"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_equipamento_scd.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Dim Produto (depende de production_orders_clean)
-        - task_key: "gold_dim_produto"
-          description: "Dimensão de produtos"
-          depends_on:
-            - task_key: "silver_production_orders_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_produto.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Dim Tecnico (depende de maintenance_orders_clean)
-        - task_key: "gold_dim_tecnico"
-          description: "Dimensão de técnicos"
-          depends_on:
-            - task_key: "silver_maintenance_orders_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_tecnico.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Dim Tipo Manutencao (depende de maintenance_orders_clean)
-        - task_key: "gold_dim_tipo_manutencao"
-          description: "Dimensão de tipos de manutenção"
-          depends_on:
-            - task_key: "silver_maintenance_orders_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_tipo_manutencao.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Dim Defeito (depende de quality_inspections_clean)
-        - task_key: "gold_dim_defeito"
-          description: "Dimensão de códigos de defeito"
-          depends_on:
-            - task_key: "silver_quality_inspections_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/dim_defeito.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # ============================================================
-        # GOLD LAYER - Fatos (dependem de dimensões e silver)
-        # ============================================================
-        
-        # Fact Producao (depende de dim_produto, dim_equipamento, dim_tempo)
-        - task_key: "gold_fact_producao"
-          description: "Fato de produção"
-          depends_on:
-            - task_key: "gold_dim_produto"
-            - task_key: "gold_dim_equipamento"
-            - task_key: "gold_dim_tempo"
-            - task_key: "silver_production_orders_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_producao.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Fact Manutencao (depende de dim_equipamento, dim_tecnico, dim_tipo_manutencao, dim_tempo)
-        - task_key: "gold_fact_manutencao"
-          description: "Fato de manutenção"
-          depends_on:
-            - task_key: "gold_dim_equipamento"
-            - task_key: "gold_dim_tecnico"
-            - task_key: "gold_dim_tipo_manutencao"
-            - task_key: "gold_dim_tempo"
-            - task_key: "silver_maintenance_orders_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_manutencao.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Fact Qualidade (depende de dim_produto, dim_equipamento, dim_defeito, dim_tempo)
-        - task_key: "gold_fact_qualidade"
-          description: "Fato de qualidade"
-          depends_on:
-            - task_key: "gold_dim_produto"
-            - task_key: "gold_dim_equipamento"
-            - task_key: "gold_dim_defeito"
-            - task_key: "gold_dim_tempo"
-            - task_key: "silver_quality_inspections_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_qualidade.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # Fact IoT Agregado (depende de dim_equipamento, dim_tempo, iot_readings_clean)
-        - task_key: "gold_fact_iot_agregado"
-          description: "Fato agregado de IoT (por hora)"
-          depends_on:
-            - task_key: "gold_dim_equipamento"
-            - task_key: "gold_dim_tempo"
-            - task_key: "silver_iot_readings_clean"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/fact_iot_agregado.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_silver: "silver"
-              schema_gold: "gold"
-
-        # ============================================================
-        # GOLD LAYER - Views Analíticas (dependem de fatos)
-        # ============================================================
-        
-        # View OEE Diario (depende de fact_producao)
-        - task_key: "gold_vw_oee_diario"
-          description: "View de OEE diário"
-          depends_on:
-            - task_key: "gold_fact_producao"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_oee_diario.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_gold: "gold"
-
-        # View Downtime por Causa (depende de fact_manutencao)
-        - task_key: "gold_vw_downtime_por_causa"
-          description: "View de downtime por causa"
-          depends_on:
-            - task_key: "gold_fact_manutencao"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_downtime_por_causa.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_gold: "gold"
-
-        # View Equipamentos Criticos (depende de múltiplos fatos)
-        - task_key: "gold_vw_equipamentos_criticos"
-          description: "View de equipamentos críticos"
-          depends_on:
-            - task_key: "gold_fact_producao"
-            - task_key: "gold_fact_manutencao"
-            - task_key: "gold_fact_qualidade"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_equipamentos_criticos.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_gold: "gold"
-
-        # View Tendencias Sensores (depende de fact_iot_agregado)
-        - task_key: "gold_vw_tendencias_sensores"
-          description: "View de tendências de sensores"
-          depends_on:
-            - task_key: "gold_fact_iot_agregado"
-          notebook_task:
-            notebook_path: "/Workspace/Users/filipeyoga@gmail.com/manutencao_preditiva_databricks/models/gold/vw_tendencias_sensores.ipynb"
-            base_parameters:
-              catalog: "manufatura_lakehouse"
-              schema_gold: "gold"
-      
-      timeout_seconds: 7200  # 2 horas
-      max_concurrent_runs: 1
-      format: MULTI_TASK
-      
-      # Notificações (opcional)
-      email_notifications:
-        on_success: []
-        on_failure: []
-        on_start: []
-      
-      # Schedule (opcional - descomente para agendar)
-      # schedule:
-      #   quartz_cron_expression: "0 0 2 * * ?"  # Diário às 2h
-      #   timezone_id: "America/Sao_Paulo"
-      #   pause_status: "UNPAUSED"
+      performance_target: PERFORMANCE_OPTIMIZED
