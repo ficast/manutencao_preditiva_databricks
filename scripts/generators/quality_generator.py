@@ -54,15 +54,34 @@ def generate_quality_inspections(count: int, seed: int = None, existing_ids: Lis
     data = []
     existing_set = set(existing_ids) if existing_ids else set()
     
+    # Encontrar o maior ID numérico existente para começar a partir dele
+    max_id_num = 10000
+    if existing_ids:
+        for existing_id in existing_ids:
+            try:
+                # Extrair número do ID (ex: "INS010000" -> 10000)
+                if existing_id.startswith("INS"):
+                    num_part = existing_id[3:]
+                    if num_part.isdigit():
+                        max_id_num = max(max_id_num, int(num_part))
+            except (ValueError, AttributeError):
+                pass
+    
     for i in range(count):
-        # Gerar ID único
-        if existing_ids and i < len(existing_ids):
-            ins_id = existing_ids[i]
-        else:
-            ins_id = f"INS{10000 + i:06d}"
-            while ins_id in existing_set:
-                ins_id = f"INS{10000 + random.randint(10000, 99999):06d}"
-            existing_set.add(ins_id)
+        # Gerar ID único começando do máximo existente + 1
+        start_num = max_id_num + 1 + i
+        ins_id = f"INS{start_num:06d}"
+        
+        # Se ainda houver colisão (improvável, mas seguro), tentar números aleatórios
+        attempts = 0
+        while ins_id in existing_set and attempts < 100:
+            ins_id = f"INS{random.randint(max_id_num + 1, 999999):06d}"
+            attempts += 1
+        
+        if ins_id in existing_set:
+            raise ValueError(f"Não foi possível gerar ID único após {attempts} tentativas")
+        
+        existing_set.add(ins_id)
         
         # Pegar ordem de produção aleatória
         po = random.choice(prod_orders)
@@ -192,8 +211,14 @@ def main():
     
     try:
         if args.mode == "insert":
+            # Buscar IDs existentes para evitar colisões
+            cursor = conn.cursor()
+            cursor.execute("SELECT inspection_id FROM bronze.quality_inspections")
+            existing_ids = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            
             print(f"🔄 Gerando {args.count} novas inspeções de qualidade...")
-            data = generate_quality_inspections(args.count, seed=args.seed)
+            data = generate_quality_inspections(args.count, seed=args.seed, existing_ids=existing_ids)
             execute_batch_insert(conn, "bronze.quality_inspections", data, batch_size=args.batch_size)
             print(f"✅ Inseridas {len(data)} inspeções")
             

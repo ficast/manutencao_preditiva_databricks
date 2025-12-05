@@ -337,24 +337,23 @@ def create_bronze_table_if_not_exists(table: str) -> None:
         raise
 
 
-def create_staging_table_if_not_exists(table: str) -> str:
+def create_temp_staging_table(table: str, cursor, columns: List[str]) -> str:
     """
-    Cria uma staging table Delta para usar em operações de MERGE.
+    Cria uma temporary table para usar em operações de MERGE.
+    Temporary tables são automaticamente limpas ao final da sessão.
     """
     full_table = get_full_table_name(table)
-    staging_table = full_table + "__staging"
+    # Usar nome único para evitar conflitos em execuções paralelas
+    temp_table = f"temp_{table}_{int(datetime.now().timestamp())}"
 
     try:
-        with get_databricks_connection() as conn:
-            with conn.cursor() as cursor:
-                # Cria staging com o mesmo schema da tabela principal
-                create_sql = f"CREATE TABLE IF NOT EXISTS {staging_table} LIKE {full_table}"
-                cursor.execute(create_sql)
-                # Garante que staging esteja vazia antes de usar
-                cursor.execute(f"TRUNCATE TABLE {staging_table}")
-        return staging_table
+        # Cria temporary table com o mesmo schema da tabela principal
+        columns_str = ", ".join([f"{col} STRING" for col in columns])
+        create_sql = f"CREATE OR REPLACE TEMPORARY TABLE {temp_table} ({columns_str})"
+        cursor.execute(create_sql)
+        return temp_table
     except Exception as e:
-        logger.error(f"Erro ao criar staging table {staging_table}: {e}")
+        logger.error(f"Erro ao criar temporary table {temp_table}: {e}")
         raise
 
 
@@ -467,25 +466,26 @@ def write_to_databricks_sql(
                     return total_processed
 
                 # INCREMENTAL (MERGE)
-                logger.info(f"Modo incremental para {table}: staging + MERGE INTO.")
+                logger.info(f"Modo incremental para {table}: temporary table + MERGE INTO.")
 
-                staging_table = create_staging_table_if_not_exists(table)
+                # Criar temporary table para staging
+                temp_staging = create_temp_staging_table(table, cursor, columns)
 
-                # INSERT na staging
+                # Inserir dados na temporary table usando parameterized queries
                 placeholders = ", ".join(["?"] * len(columns))
                 columns_str = ", ".join(columns)
-                insert_staging = f"INSERT INTO {staging_table} ({columns_str}) VALUES ({placeholders})"
+                insert_temp = f"INSERT INTO {temp_staging} ({columns_str}) VALUES ({placeholders})"
 
                 for i in range(0, len(data), batch_size):
                     batch = data[i:i + batch_size]
                     values = [tuple(row.get(col) for col in columns) for row in batch]
-                    cursor.executemany(insert_staging, values)
+                    cursor.executemany(insert_temp, values)
 
                     total_processed += len(batch)
                     if progress and task_id:
                         progress.update(task_id, completed=total_processed)
 
-                # MERGE INTO
+                # MERGE INTO usando a temporary table
                 non_pk_cols = [c for c in columns if c != primary_key]
                 set_clause = ", ".join([f"t.{c} = s.{c}" for c in non_pk_cols])
                 insert_cols = ", ".join(columns)
@@ -493,14 +493,13 @@ def write_to_databricks_sql(
 
                 merge_sql = f"""
                     MERGE INTO {full_table} t
-                    USING {staging_table} s
+                    USING {temp_staging} s
                     ON t.{primary_key} = s.{primary_key}
                     WHEN MATCHED THEN UPDATE SET {set_clause}
                     WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
                 """
 
                 cursor.execute(merge_sql)
-                cursor.execute(f"TRUNCATE TABLE {staging_table}")
 
                 print_success(
                     f"MERGE concluído para {table}. Registros processados: {total_processed}"
