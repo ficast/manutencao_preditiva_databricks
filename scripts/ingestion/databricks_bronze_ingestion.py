@@ -339,21 +339,33 @@ def create_bronze_table_if_not_exists(table: str) -> None:
 
 def create_temp_staging_table(table: str, cursor, columns: List[str]) -> str:
     """
-    Cria uma temporary table para usar em operações de MERGE.
-    Temporary tables são automaticamente limpas ao final da sessão.
+    Cria uma tabela staging temporária no schema bronze para usar em operações de MERGE.
+    A tabela será removida após o uso.
     """
-    full_table = get_full_table_name(table)
+    schema = get_schema_name()
     # Usar nome único para evitar conflitos em execuções paralelas
-    temp_table = f"temp_{table}_{int(datetime.now().timestamp())}"
+    temp_table_name = f"temp_{table}_{int(datetime.now().timestamp())}"
+    temp_table = f"{schema}.{temp_table_name}"
 
     try:
-        # Cria temporary table com o mesmo schema da tabela principal
+        # Criar tabela staging normal (não temporary) no schema bronze
         columns_str = ", ".join([f"{col} STRING" for col in columns])
-        create_sql = f"CREATE OR REPLACE TEMPORARY TABLE {temp_table} ({columns_str})"
+        
+        # Dropar se existir (pode ter ficado de execução anterior)
+        try:
+            cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
+        except Exception:
+            pass  # Ignora erros ao dropar
+        
+        # Criar a tabela staging com DELTA
+        create_sql = f"""
+            CREATE TABLE {temp_table} ({columns_str})
+            USING DELTA
+        """
         cursor.execute(create_sql)
         return temp_table
     except Exception as e:
-        logger.error(f"Erro ao criar temporary table {temp_table}: {e}")
+        logger.error(f"Erro ao criar staging table {temp_table}: {e}")
         raise
 
 
@@ -485,7 +497,7 @@ def write_to_databricks_sql(
                     if progress and task_id:
                         progress.update(task_id, completed=total_processed)
 
-                # MERGE INTO usando a temporary table
+                # MERGE INTO usando a staging table
                 non_pk_cols = [c for c in columns if c != primary_key]
                 set_clause = ", ".join([f"t.{c} = s.{c}" for c in non_pk_cols])
                 insert_cols = ", ".join(columns)
@@ -500,6 +512,12 @@ def write_to_databricks_sql(
                 """
 
                 cursor.execute(merge_sql)
+                
+                # Limpar a staging table após o MERGE
+                try:
+                    cursor.execute(f"DROP TABLE IF EXISTS {temp_staging}")
+                except Exception:
+                    logger.warning(f"Não foi possível dropar staging table {temp_staging}")
 
                 print_success(
                     f"MERGE concluído para {table}. Registros processados: {total_processed}"

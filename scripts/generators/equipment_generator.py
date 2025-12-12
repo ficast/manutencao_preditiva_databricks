@@ -64,14 +64,36 @@ def generate_equipment_data(count: int, seed: int = None, existing_ids: List[str
     data = []
     existing_set = set(existing_ids) if existing_ids else set()
     
+    # Encontrar o maior ID numérico existente para começar a partir dele
+    max_id_num = 10000
+    if existing_ids:
+        for existing_id in existing_ids:
+            try:
+                # Extrair número do ID (ex: "EQ10000" -> 10000)
+                if existing_id.startswith("EQ"):
+                    num_part = existing_id[2:]
+                    if num_part.isdigit():
+                        max_id_num = max(max_id_num, int(num_part))
+            except (ValueError, AttributeError):
+                pass
+    
     for i in range(count):
-        # Gerar ID único
+        # Gerar ID único começando do máximo existente + 1
         if existing_ids and i < len(existing_ids):
             eid = existing_ids[i]
         else:
-            eid = f"EQ{10000 + i:05d}"
-            while eid in existing_set:
-                eid = f"EQ{10000 + random.randint(10000, 99999):05d}"
+            start_num = max_id_num + 1 + i
+            eid = f"EQ{start_num:05d}"
+            
+            # Se ainda houver colisão (improvável, mas seguro), tentar números aleatórios
+            attempts = 0
+            while eid in existing_set and attempts < 100:
+                eid = f"EQ{random.randint(max_id_num + 1, 99999):05d}"
+                attempts += 1
+            
+            if eid in existing_set:
+                raise ValueError(f"Não foi possível gerar ID único após {attempts} tentativas")
+            
             existing_set.add(eid)
         
         eq_type = random.choice(EQUIPMENT_TYPES)
@@ -196,6 +218,12 @@ def main():
     
     try:
         if args.mode == "insert":
+            # Buscar IDs existentes para evitar colisões
+            cursor = conn.cursor()
+            cursor.execute("SELECT equipment_id FROM bronze.equipment_master")
+            existing_ids = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            
             logger.info(f"Gerando {args.count} novos equipamentos...")
             
             with Progress(
@@ -205,7 +233,7 @@ def main():
                 TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             ) as progress:
                 task = progress.add_task("Gerando dados...", total=args.count)
-                data = generate_equipment_data(args.count, seed=args.seed)
+                data = generate_equipment_data(args.count, seed=args.seed, existing_ids=existing_ids)
                 progress.update(task, completed=args.count)
             
             logger.info(f"Inserindo {len(data)} registros no PostgreSQL...")

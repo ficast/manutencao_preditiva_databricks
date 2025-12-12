@@ -61,14 +61,36 @@ def generate_production_orders(count: int, seed: int = None, existing_ids: List[
     data = []
     existing_set = set(existing_ids) if existing_ids else set()
     
+    # Encontrar o maior ID numérico existente para começar a partir dele
+    max_id_num = 10000
+    if existing_ids:
+        for existing_id in existing_ids:
+            try:
+                # Extrair número do ID (ex: "PO010000" -> 10000)
+                if existing_id.startswith("PO"):
+                    num_part = existing_id[2:]
+                    if num_part.isdigit():
+                        max_id_num = max(max_id_num, int(num_part))
+            except (ValueError, AttributeError):
+                pass
+    
     for i in range(count):
-        # Gerar ID único
+        # Gerar ID único começando do máximo existente + 1
         if existing_ids and i < len(existing_ids):
             po_id = existing_ids[i]
         else:
-            po_id = f"PO{10000 + i:06d}"
-            while po_id in existing_set:
-                po_id = f"PO{10000 + random.randint(10000, 99999):06d}"
+            start_num = max_id_num + 1 + i
+            po_id = f"PO{start_num:06d}"
+            
+            # Se ainda houver colisão (improvável, mas seguro), tentar números aleatórios
+            attempts = 0
+            while po_id in existing_set and attempts < 100:
+                po_id = f"PO{random.randint(max_id_num + 1, 999999):06d}"
+                attempts += 1
+            
+            if po_id in existing_set:
+                raise ValueError(f"Não foi possível gerar ID único após {attempts} tentativas")
+            
             existing_set.add(po_id)
         
         eq_id = random.choice(equipment_ids)
@@ -206,8 +228,14 @@ def main():
     
     try:
         if args.mode == "insert":
+            # Buscar IDs existentes para evitar colisões
+            cursor = conn.cursor()
+            cursor.execute("SELECT production_order_id FROM bronze.production_orders")
+            existing_ids = [row[0] for row in cursor.fetchall()]
+            cursor.close()
+            
             print(f"🔄 Gerando {args.count} novas ordens de produção...")
-            data = generate_production_orders(args.count, seed=args.seed)
+            data = generate_production_orders(args.count, seed=args.seed, existing_ids=existing_ids)
             execute_batch_insert(conn, "bronze.production_orders", data, batch_size=args.batch_size)
             print(f"✅ Inseridas {len(data)} ordens de produção")
             

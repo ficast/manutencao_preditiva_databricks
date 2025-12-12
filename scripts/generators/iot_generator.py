@@ -42,7 +42,7 @@ UNITS_MAP = {
 }
 
 
-def generate_iot_readings(count: int, seed: int = None, hours_back: int = 24) -> List[Dict]:
+def generate_iot_readings(count: int, seed: int = None, hours_back: int = 24, existing_ids: List[str] = None) -> List[Dict]:
     """
     Gera leituras IoT (append-only).
     
@@ -50,6 +50,7 @@ def generate_iot_readings(count: int, seed: int = None, hours_back: int = 24) ->
         count: Quantidade de leituras a gerar
         seed: Seed para reprodutibilidade
         hours_back: Quantas horas atrás começar a gerar timestamps
+        existing_ids: Lista de IDs existentes para evitar colisões
     
     Returns:
         Lista de dicionários com leituras IoT
@@ -69,7 +70,37 @@ def generate_iot_readings(count: int, seed: int = None, hours_back: int = 24) ->
         raise ValueError("Nenhum equipamento encontrado. Execute equipment_generator.py primeiro.")
     
     readings = []
+    existing_set = set(existing_ids) if existing_ids else set()
+    
+    # Encontrar o maior ID numérico existente para começar a partir dele
+    max_id_num = 1000000
+    if existing_ids:
+        for existing_id in existing_ids:
+            try:
+                # Extrair número do ID (ex: "IOT01000000" -> 1000000)
+                if existing_id.startswith("IOT"):
+                    num_part = existing_id[3:]
+                    if num_part.isdigit():
+                        max_id_num = max(max_id_num, int(num_part))
+            except (ValueError, AttributeError):
+                pass
+    
     for i in range(count):
+        # Gerar ID único começando do máximo existente + 1
+        start_num = max_id_num + 1 + i
+        reading_id = f"IOT{start_num:08d}"
+        
+        # Se ainda houver colisão (improvável, mas seguro), tentar números aleatórios
+        attempts = 0
+        while reading_id in existing_set and attempts < 100:
+            reading_id = f"IOT{random.randint(max_id_num + 1, 99999999):08d}"
+            attempts += 1
+        
+        if reading_id in existing_set:
+            raise ValueError(f"Não foi possível gerar ID único após {attempts} tentativas")
+        
+        existing_set.add(reading_id)
+        
         eq_id = random.choice(equipment_ids)
         sensor_type = random.choice(SENSOR_TYPES)
         
@@ -110,7 +141,7 @@ def generate_iot_readings(count: int, seed: int = None, hours_back: int = 24) ->
         )
         
         reading = {
-            "reading_id": f"IOT{1000000 + i:08d}",
+            "reading_id": reading_id,
             "equipment_id": eq_id,
             "sensor_id": sensor_id,
             "sensor_type": sensor_type_display,
@@ -155,7 +186,15 @@ def main():
     print(f"🔄 Gerando {args.count} leituras IoT (últimas {args.hours_back}h)...")
     
     try:
-        readings = generate_iot_readings(args.count, seed=args.seed, hours_back=args.hours_back)
+        # Buscar IDs existentes para evitar colisões
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT reading_id FROM bronze.iot_sensor_readings")
+        existing_ids = [row[0] for row in cursor.fetchall()]
+        cursor.close()
+        conn.close()
+        
+        readings = generate_iot_readings(args.count, seed=args.seed, hours_back=args.hours_back, existing_ids=existing_ids)
         
         conn = get_db_connection()
         execute_batch_insert(conn, "bronze.iot_sensor_readings", readings, batch_size=args.batch_size)
